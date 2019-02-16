@@ -1,0 +1,266 @@
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.all;
+use ieee.numeric_std.all;
+use work.lwe_encryption_pkg.all;
+use work.lattice_processor.all;
+use ieee.math_real.all;
+
+entity lwe_encryption is
+  generic (
+    PRIME_P    : unsigned     := to_unsigned(7681, 13);
+    N_ELEMENTS : integer      := 256;
+    MODE : string := "BOTH";
+    INIT_ARRAY : init_array_t := (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    );
+  port (
+    clk : in std_logic;
+    ready : out std_logic;
+
+    -- Input commands to the engine 
+    start   : in std_logic;
+    command : in std_logic_vector(COMMAND_LENGTH-1 downto 0);
+    
+    --Interface for message
+    m_in  : in  std_logic_vector(N_ELEMENTS-1 downto 0);
+    m_out : out std_logic_vector(N_ELEMENTS-1 downto 0) :=(others => '0');
+    
+	-- Interface for RAM
+	addr  : in  std_logic_vector(integer(ceil(log2(real(4*N_ELEMENTS))))-1 downto 0);
+    din   : in  std_logic_vector(PRIME_P'length-1 downto 0);
+    dout  : out std_logic_vector(PRIME_P'length-1 downto 0);
+    we    : in  std_logic;
+    delay : out integer;
+
+    --for debugging
+    cycles : out unsigned(15 downto 0)
+	
+	end lwe_encryption;
+
+architecture Behavioral of lwe_encryption is
+  constant PRIME_P_WIDTH : integer := PRIME_P'length;
+  signal  m_out_r1 :  std_logic_vector(N_ELEMENTS-1 downto 0) :=(others => '0');
+  signal start_encrypt  : std_logic;
+  signal start_r1       : std_logic;
+  signal start_r2       : std_logic;
+  signal start_decrypt  : std_logic;
+  signal start_key_load : std_logic;
+  signal finished       : std_logic;
+  signal c1_req         : std_logic;
+  signal c2_req         : std_logic;
+  signal p_req          : std_logic;
+  signal r2_req         : std_logic;
+  signal data_out       : std_logic_vector(PRIME_P'length-1 downto 0);
+  signal addr_out       : std_logic_vector(integer(ceil(log2(real(N_ELEMENTS))))-1 downto 0);
+  signal we_out         : std_logic;
+  signal data_delay     : integer := 10;
+  signal addr_in        : std_logic_vector(integer(ceil(log2(real(N_ELEMENTS))))-1 downto 0);
+  signal start_key_gen  : std_logic;
+
+  signal intern_we        : std_logic                                  := '0';
+  signal intern_addr      : std_logic_vector(addr'length-1 downto 0)   := (others => '0');
+  signal intern_addr_temp : std_logic_vector(addr'length-1 downto 0)   := (others => '0');
+  signal intern_din       : std_logic_vector(PRIME_P_WIDTH-1 downto 0) := (others => '0');
+  signal intern_dout      : std_logic_vector(PRIME_P_WIDTH-1 downto 0) := (others => '0');
+
+  signal addr_r1 : std_logic_vector(integer(ceil(log2(real(N_ELEMENTS))))-1 downto 0);
+  signal dout_r1 : std_logic_vector(PRIME_P'length-1 downto 0);
+  signal we_r1   : std_logic;
+  signal addr_r2 : std_logic_vector(integer(ceil(log2(real(4*N_ELEMENTS))))-1 downto 0);
+  signal dout_r2 : std_logic_vector(PRIME_P'length-1+1 downto 0);
+  signal we_r2   : std_logic;
+
+  signal ciphertext_out_r : std_logic;
+  signal message_out_r    : std_logic;
+  signal ciphertext_out : std_logic;
+  signal message_out    : std_logic;
+
+  signal check  : std_logic := '0';
+  signal check1 : std_logic := '0';
+
+  signal m_out_intern : std_logic_vector(integer(ceil(log2(real(N_ELEMENTS))))-1 downto 0);
+  signal m_in_r1 : std_logic_vector(N_ELEMENTS-1 downto 0);
+
+  type   eg_state is (IDLE, EXEC_COMMAND);
+  signal state_reg : eg_state := IDLE;
+  
+begin
+
+  delay <= 6;
+  data_ram : entity work.bram_with_delay
+    generic map (
+      SIZE       => 4*N_ELEMENTS,
+      ADDR_WIDTH => addr'length,
+      COL_WIDTH  => PRIME_P_WIDTH,
+      add_reg_a  => 2,
+      add_reg_b  => 1,
+      InitFile   => ""
+      )
+    port map (
+      clka  => clk,
+      clkb  => clk,
+      ena   => '1',
+      enb   => '1',
+      wea   => we,
+      web   => intern_we,
+      addra => addr,
+      addrb => intern_addr,
+      dia   => din,
+      dib   => intern_din,
+      doa   => dout,
+      dob   => intern_dout
+      );
+
+
+  process (clk)
+  begin
+    if rising_edge(clk) then
+      First input stage
+	   bdi_r     <= bdi;
+      addr_r1          <= std_logic_vector(resize(unsigned(addr_out) xor unsigned(addr_in), addr_r1'length));
+
+      m_out <= m_out_r1;
+      if we_out = '1' then
+        addr_r1 <= std_logic_vector(resize(unsigned(addr_out), addr_r1'length));
+      else
+        addr_r1 <= std_logic_vector(resize(unsigned(addr_in), addr_r1'length));
+      end if;
+
+      if start_r2 = '1' then
+        m_in_r1 <= m_in;
+      end if;
+
+      if finished = '1' then
+        check  <= '0';
+        check1 <= '0';
+      end if;
+
+      dout_r1          <= data_out;
+      dout_r2          <= "0"&std_logic_vector(unsigned(dout_r1));
+      we_r1            <= we_out;
+      ciphertext_out_r <= ciphertext_out;
+      message_out_r   <= message_out;
+
+      -- Add the message to every coefficient
+      if ciphertext_out_r = '1' then
+        
+        m_in_r1 <= std_logic_vector(unsigned(m_in_r1) srl 1);
+        if m_in_r1(0) = '1' then
+          dout_r2 <= std_logic_vector(resize(unsigned(dout_r1), dout_r2'length)+PRIME_P/2);
+        elsedd
+          dout_r2 <= "0"&std_logic_vector(unsigned(dout_r1));
+        end if;
+      elsif message_out_r = '1' then
+      
+        if check = '0' then
+          if (unsigned(dout_r1) < (PRIME_P/4)) or (unsigned(dout_r1) > ((3*PRIME_P)/4)) then
+            m_out_r1(to_integer(unsigned(addr_r1))) <= '0';
+          else
+            m_out_r1(to_integer(unsigned(addr_r1))) <= '1';
+          end if;
+
+          if unsigned(addr_r1) = 1 then
+            check1 <= '1';
+          end if;
+
+          if unsigned(addr_r1) = N_ELEMENTS-1 and check1 = '1' then
+            check <= '1';
+          end if;
+          
+        end if;
+        dout_r2 <= "0"&dout_r1;
+      else
+        dout_r2 <= "0"&dout_r1;
+      end if;
+
+      we_r2 <= we_r1;
+      
+      if c1_req = '1' then
+        addr_r2 <= std_logic_vector(resize(unsigned(addr_r1), addr_r2'length));
+      elsif c2_req = '1' then
+        addr_r2 <= std_logic_vector(to_unsigned(1*N_ELEMENTS+to_integer(unsigned(addr_r1)), addr_r2'length));
+      elsif r2_req = '1' then
+        addr_r2 <= std_logic_vector(to_unsigned(2*N_ELEMENTS+to_integer(unsigned(addr_r1)), addr_r2'length));
+      elsif p_req = '1' then
+        addr_r2 <= std_logic_vector(to_unsigned(3*N_ELEMENTS+to_integer(unsigned(addr_r1)), addr_r2'length));
+      else
+        addr_r2 <= (others => '0');
+      end if;
+      
+    end if;
+  end process;
+
+  intern_addr <= addr_r2;
+  intern_we   <= we_r2;
+  intern_din  <= dout_r2(intern_din'range) when unsigned(dout_r2) < PRIME_P else std_logic_vector(resize(unsigned(dout_r2)-PRIME_P, intern_din'length));
+
+
+  lwe_processor_1 : entity work.lwe_processor
+    generic map (
+      PRIME_P    => PRIME_P,
+      N_ELEMENTS => N_ELEMENTS,
+      MODE => MODE,
+      INIT_ARRAY => INIT_ARRAY
+      )
+    port map (
+      clk            => clk,
+      start_encrypt  => start_encrypt,
+      start_decrypt  => start_decrypt,
+      start_key_gen  => start_key_gen,
+      start_key_load => start_key_load,
+      finished       => finished,
+      cycles         => cycles,
+      c1_req         => c1_req,
+      c2_req         => c2_req,
+      p_req          => p_req,
+      r2_req         => r2_req,
+      ciphertext_out => ciphertext_out,
+      message_out    => message_out,
+      data_out       => data_out,
+      addr_out       => addr_out,
+      we_out         => we_out,
+      data_delay     => data_delay,
+      data_in        => intern_dout,
+      addr_in        => addr_in
+      );
+      
+  --Control logic
+  process (clk)
+  begin
+    if rising_edge(clk) then
+      start_r2 <= start;
+      start_r1 <= start_r2;
+
+      ready          <= '0';
+      start_decrypt  <= '0';
+      start_encrypt  <= '0';
+      start_key_gen  <= '0'; 
+      start_key_load <= '0'; 
+
+      case state_reg is
+        when IDLE =>
+          ready <= '1';
+          if start_r1 = '1' then
+            if command = COMMAND_ENC then
+              start_encrypt <= '1';
+            elsif command = COMMAND_DEC then
+              start_decrypt <= '1';
+            elsif command = COMMAND_KEY_LOAD then	
+              start_key_load <= '1';					
+            elsif command = COMMAND_KEY_GEN then		
+              start_key_gen <= '1';					
+            end if;
+            state_reg <= EXEC_COMMAND;
+          end if;
+
+        when EXEC_COMMAND =>
+          if finished = '1' then
+            state_reg <= IDLE;
+          end if;
+      end case;
+    end if;
+  end process;
+
+
+end Behavioral;
+
